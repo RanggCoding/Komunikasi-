@@ -6,7 +6,7 @@
     <title>Multi-Channel Web Walkie-Talkie</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Firebase SDK (Modular v13.2.0 sesuai konfigurasi Anda) -->
+    <!-- Firebase SDK (Modular v13.2.0) -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-app.js";
         import { getDatabase, ref, push, onChildAdded } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-database.js";
@@ -32,18 +32,18 @@
         let mediaRecorder;
         let audioChunks = [];
         let currentChannel = "channel-1";
+        let userJoinTime = Date.now(); // Mencatat waktu saat pertama kali buka / pindah channel
 
-        const pttBtn = document.getElementById('ptt-btn');
-        const led = document.getElementById('led');
-        const statusText = document.getElementById('status-text');
         const channelSelect = document.getElementById('channel-select');
         const infoText = document.getElementById('info-text');
+        const led = document.getElementById('led');
+        const statusText = document.getElementById('status-text');
 
         // Ganti channel saat dropdown diubah
         channelSelect.addEventListener('change', (e) => {
             currentChannel = e.target.value;
+            userJoinTime = Date.now(); // Reset waktu join agar pesan lama tidak ikut terputar
             infoText.textContent = `Pindah ke ${channelSelect.options[channelSelect.selectedIndex].text}`;
-            subscribeChannel(currentChannel);
         });
 
         // Efek suara Squelch (Krrrk)
@@ -82,7 +82,6 @@
                     reader.readAsDataURL(audioBlob);
                     reader.onloadend = () => {
                         const base64Audio = reader.result;
-                        // Kirim ke Firebase Realtime Database berdasarkan channel aktif
                         const messagesRef = ref(db, `channels/${currentChannel}`);
                         push(messagesRef, {
                             sender: clientId,
@@ -132,22 +131,17 @@
             pttBtn.addEventListener('touchend', stopTransmit);
         });
 
-        // Listener Global untuk pesan masuk
-        function subscribeChannel(channelName) {
-            const channelRef = ref(db, `channels/${channelName}`);
-            onChildAdded(channelRef, (snapshot) => {
+        // Listener untuk SEMUA channel, difilter berdasarkan waktu join dan channel aktif
+        ['channel-1', 'channel-2', 'channel-3'].forEach(chan => {
+            onChildAdded(ref(db, `channels/${chan}`), (snapshot) => {
                 const data = snapshot.val();
-                // Jika pengirim BUKAN diri sendiri, putar audionya
-                if (data && data.sender !== clientId) {
+                if (chan === currentChannel && data && data.sender !== clientId && data.timestamp > userJoinTime) {
                     playSquelch();
                     const audio = new Audio(data.audio);
                     audio.play().catch(e => console.log("Autoplay blocked"));
                 }
             });
-        }
-        
-        // Langganan awal ke channel 1
-        subscribeChannel("channel-1");
+        });
     </script>
 </head>
 <body class="bg-slate-900 text-white min-h-screen flex flex-col items-center justify-center p-4">
