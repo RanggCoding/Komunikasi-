@@ -3,15 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Multi-Channel Web Walkie-Talkie</title>
+    <title>Multi-Channel Web Walkie-Talkie with Auto-Cleanup</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Firebase SDK (Modular v13.2.0) -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-app.js";
-        import { getDatabase, ref, push, onChildAdded } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-database.js";
+        import { getDatabase, ref, set, get, push, onChildAdded, onValue, remove, onDisconnect, query, orderByChild, endAt } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-database.js";
 
-        // Konfigurasi Firebase Anda
         const firebaseConfig = {
             apiKey: "AIzaSyB-PLp7Y5hDkOEgj410ubuULunXJQSfu2o",
             authDomain: "walkie-talkie-c57d0.firebaseapp.com",
@@ -26,168 +25,274 @@
         const app = initializeApp(firebaseConfig);
         const db = getDatabase(app);
 
-        // ID Unik untuk setiap sesi browser (agar tidak mendengar suara sendiri)
-        const clientId = 'user_' + Math.random().toString(36).substring(2, 9);
-        
+        let currentUsername = "";
         let mediaRecorder;
         let audioChunks = [];
         let currentChannel = "channel-1";
-        let userJoinTime = Date.now(); // Mencatat waktu saat pertama kali buka / pindah channel
+        let userJoinTime = Date.now();
 
+        const loginModal = document.getElementById('login-modal');
+        const loginBtn = document.getElementById('login-btn');
+        const usernameInput = document.getElementById('username-input');
+        const loginError = document.getElementById('login-error');
+        const appContainer = document.getElementById('app-container');
+        const welcomeUser = document.getElementById('welcome-user');
+        
         const channelSelect = document.getElementById('channel-select');
         const infoText = document.getElementById('info-text');
         const led = document.getElementById('led');
         const statusText = document.getElementById('status-text');
+        const liveBoardList = document.getElementById('live-board-list');
 
-        // Ganti channel saat dropdown diubah
-        channelSelect.addEventListener('change', (e) => {
-            currentChannel = e.target.value;
-            userJoinTime = Date.now(); // Reset waktu join agar pesan lama tidak ikut terputar
-            infoText.textContent = `Pindah ke ${channelSelect.options[channelSelect.selectedIndex].text}`;
+        // Fungsi Pembersihan Otomatis Pesan Lama (> 1 Jam)
+        async function cleanOldMessages() {
+            try {
+                const oneHourAgo = Date.now() - (60 * 60 * 1000);
+                ['channel-1', 'channel-2', 'channel-3'].forEach(async (chan) => {
+                    const channelRef = ref(db, `channels/${chan}`);
+                    const oldMessagesQuery = query(channelRef, orderByChild('timestamp'), endAt(oneHourAgo));
+                    
+                    const snapshot = await get(oldMessagesQuery);
+                    if (snapshot.exists()) {
+                        snapshot.forEach((childSnapshot) => {
+                            remove(childSnapshot.ref);
+                        });
+                    }
+                });
+            } catch (e) {
+                console.log("Cleanup error:", e);
+            }
+        }
+
+        // Proses Login & Validasi USER[1-200]
+        loginBtn.addEventListener('click', async () => {
+            let inputVal = usernameInput.value.trim().toUpperCase();
+            
+            const regex = /^USER([1-9]|[1-9][0-9]|1[0-9]{2}|200)$/;
+            if (!regex.test(inputVal)) {
+                loginError.textContent = "Format salah! Harus format: USER1 sampai USER200 (Cth: USER45)";
+                return;
+            }
+
+            const userRef = ref(db, `activeUsers/${inputVal}`);
+            const snapshot = await get(userRef);
+
+            if (snapshot.exists()) {
+                loginError.textContent = `Nomor ${inputVal} sudah digunakan orang lain! Pilih nomor lain.`;
+                return;
+            }
+
+            currentUsername = inputVal;
+            await set(userRef, { online: true, channel: currentChannel });
+            onDisconnect(userRef).remove();
+
+            loginModal.classList.add('hidden');
+            appContainer.classList.remove('hidden');
+            welcomeUser.textContent = `Login sebagai: ${currentUsername}`;
+
+            initWalkieTalkie();
         });
 
-        // Efek suara Squelch (Krrrk)
-        function playSquelch() {
-            try {
-                const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                const bufferSize = ctx.sampleRate * 0.12;
-                const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-                const data = buffer.getChannelData(0);
-                for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
-
-                const noise = ctx.createBufferSource();
-                noise.buffer = buffer;
-                const filter = ctx.createBiquadFilter();
-                filter.type = 'bandpass';
-                filter.frequency.value = 1200;
-
-                noise.connect(filter);
-                filter.connect(ctx.destination);
-                noise.start();
-            } catch(e) {}
-        }
-
-        // Inisialisasi Mikrofon
-        navigator.mediaDevices.getUserMedia({ audio: true })
-            .then(stream => {
-                mediaRecorder = new MediaRecorder(stream);
-
-                mediaRecorder.ondataavailable = e => {
-                    audioChunks.push(e.data);
-                };
-
-                mediaRecorder.onstop = () => {
-                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-                    const reader = new FileReader();
-                    reader.readAsDataURL(audioBlob);
-                    reader.onloadend = () => {
-                        const base64Audio = reader.result;
-                        const messagesRef = ref(db, `channels/${currentChannel}`);
-                        push(messagesRef, {
-                            sender: clientId,
-                            audio: base64Audio,
-                            timestamp: Date.now()
-                        });
-                    };
-                    audioChunks = [];
-                };
-            })
-            .catch(err => {
-                alert("Gagal mengakses mikrofon!");
-                infoText.textContent = "Izin mikrofon ditolak!";
+        function initWalkieTalkie() {
+            channelSelect.addEventListener('change', async (e) => {
+                currentChannel = e.target.value;
+                userJoinTime = Date.now();
+                infoText.textContent = `Pindah ke ${channelSelect.options[channelSelect.selectedIndex].text}`;
+                
+                if (currentUsername) {
+                    await set(ref(db, `activeUsers/${currentUsername}/channel`), currentChannel);
+                }
+                updateLiveBoard();
             });
 
-        // Tombol PTT
-        function startTransmit(e) {
-            e.preventDefault();
-            if (!mediaRecorder || mediaRecorder.state === "recording") return;
-            playSquelch();
-            audioChunks = [];
-            mediaRecorder.start();
+            function playSquelch() {
+                try {
+                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                    const bufferSize = ctx.sampleRate * 0.12;
+                    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+                    const data = buffer.getChannelData(0);
+                    for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
 
-            led.classList.remove('bg-red-600', 'shadow-[0_0_10px_red]');
-            led.classList.add('bg-green-500', 'shadow-[0_0_15px_green]');
-            statusText.textContent = "TRANSMITTING";
-            statusText.className = "text-xs font-mono uppercase text-green-400 font-bold";
-        }
+                    const noise = ctx.createBufferSource();
+                    noise.buffer = buffer;
+                    const filter = ctx.createBiquadFilter();
+                    filter.type = 'bandpass';
+                    filter.frequency.value = 1200;
 
-        function stopTransmit(e) {
-            e.preventDefault();
-            if (!mediaRecorder || mediaRecorder.state !== "recording") return;
-            mediaRecorder.stop();
-            playSquelch();
+                    noise.connect(filter);
+                    filter.connect(ctx.destination);
+                    noise.start();
+                } catch(e) {}
+            }
 
-            led.classList.remove('bg-green-500', 'shadow-[0_0_15px_green]');
-            led.classList.add('bg-red-600', 'shadow-[0_0_10px_red]');
-            statusText.textContent = "STANDBY";
-            statusText.className = "text-xs font-mono uppercase text-slate-400";
-        }
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    mediaRecorder = new MediaRecorder(stream);
 
-        window.addEventListener('DOMContentLoaded', () => {
+                    mediaRecorder.ondataavailable = e => {
+                        audioChunks.push(e.data);
+                    };
+
+                    mediaRecorder.onstop = () => {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                        const reader = new FileReader();
+                        reader.readAsDataURL(audioBlob);
+                        reader.onloadend = async () => {
+                            const base64Audio = reader.result;
+                            const messagesRef = ref(db, `channels/${currentChannel}`);
+                            await push(messagesRef, {
+                                sender: currentUsername,
+                                audio: base64Audio,
+                                timestamp: Date.now()
+                            });
+
+                            // Jalankan pembersihan otomatis setiap kali pesan baru dikirim
+                            cleanOldMessages();
+                        };
+                        audioChunks = [];
+                    };
+                })
+                .catch(err => {
+                    alert("Gagal mengakses mikrofon!");
+                    infoText.textContent = "Izin mikrofon ditolak!";
+                });
+
             const pttBtn = document.getElementById('ptt-btn');
+            function startTransmit(e) {
+                e.preventDefault();
+                if (!mediaRecorder || mediaRecorder.state === "recording") return;
+                playSquelch();
+                audioChunks = [];
+                mediaRecorder.start();
+
+                led.classList.remove('bg-red-600', 'shadow-[0_0_10px_red]');
+                led.classList.add('bg-green-500', 'shadow-[0_0_15px_green]');
+                statusText.textContent = "TRANSMITTING";
+                statusText.className = "text-xs font-mono uppercase text-green-400 font-bold";
+            }
+
+            function stopTransmit(e) {
+                e.preventDefault();
+                if (!mediaRecorder || mediaRecorder.state !== "recording") return;
+                mediaRecorder.stop();
+                playSquelch();
+
+                led.classList.remove('bg-green-500', 'shadow-[0_0_15px_green]');
+                led.classList.add('bg-red-600', 'shadow-[0_0_10px_red]');
+                statusText.textContent = "STANDBY";
+                statusText.className = "text-xs font-mono uppercase text-slate-400";
+            }
+
             pttBtn.addEventListener('mousedown', startTransmit);
             pttBtn.addEventListener('mouseup', stopTransmit);
             pttBtn.addEventListener('touchstart', startTransmit);
             pttBtn.addEventListener('touchend', stopTransmit);
-        });
 
-        // Listener untuk SEMUA channel, difilter berdasarkan waktu join dan channel aktif
-        ['channel-1', 'channel-2', 'channel-3'].forEach(chan => {
-            onChildAdded(ref(db, `channels/${chan}`), (snapshot) => {
-                const data = snapshot.val();
-                if (chan === currentChannel && data && data.sender !== clientId && data.timestamp > userJoinTime) {
-                    playSquelch();
-                    const audio = new Audio(data.audio);
-                    audio.play().catch(e => console.log("Autoplay blocked"));
-                }
+            ['channel-1', 'channel-2', 'channel-3'].forEach(chan => {
+                onChildAdded(ref(db, `channels/${chan}`), (snapshot) => {
+                    const data = snapshot.val();
+                    if (chan === currentChannel && data && data.sender !== currentUsername && data.timestamp > userJoinTime) {
+                        playSquelch();
+                        const audio = new Audio(data.audio);
+                        audio.play().catch(e => console.log("Autoplay blocked"));
+                        
+                        infoText.textContent = `🔊 Sedang mendengarkan: ${data.sender}`;
+                        setTimeout(() => { infoText.textContent = "Tahan PTT untuk bicara di channel aktif"; }, 3000);
+                    }
+                });
             });
-        });
+
+            function updateLiveBoard() {
+                onValue(ref(db, `activeUsers`), (snapshot) => {
+                    liveBoardList.innerHTML = '';
+                    if (snapshot.exists()) {
+                        snapshot.forEach((childSnapshot) => {
+                            const userData = childSnapshot.val();
+                            const username = childSnapshot.key;
+                            
+                            if (userData.channel === currentChannel) {
+                                const li = document.createElement('li');
+                                li.className = "flex items-center justify-between text-xs font-mono bg-slate-900 p-2 rounded border border-slate-800";
+                                li.innerHTML = `<span class="text-green-400 font-bold">● ${username}</span> <span class="text-slate-500 text-[10px]">Online</span>`;
+                                liveBoardList.appendChild(li);
+                            }
+                        });
+                    }
+                    if (liveBoardList.children.length === 0) {
+                        liveBoardList.innerHTML = '<li class="text-xs text-slate-500 italic text-center">Belum ada user lain di channel ini.</li>';
+                    }
+                });
+            }
+            updateLiveBoard();
+        }
     </script>
 </head>
 <body class="bg-slate-900 text-white min-h-screen flex flex-col items-center justify-center p-4">
 
-    <!-- Kontainer Walkie Talkie -->
-    <div class="bg-amber-700 border-4 border-amber-900 rounded-3xl p-6 shadow-2xl w-full max-w-xs flex flex-col items-center relative">
+    <!-- MODAL LOGIN USER -->
+    <div id="login-modal" class="fixed inset-0 bg-slate-950/90 flex items-center justify-center p-4 z-50">
+        <div class="bg-slate-900 border-2 border-amber-800 rounded-2xl p-6 max-w-sm w-full shadow-2xl text-center">
+            <h2 class="text-amber-500 font-bold text-lg mb-2 uppercase tracking-wider">Login Walkie-Talkie</h2>
+            <p class="text-slate-400 text-xs mb-4">Masukkan nomor identitas Anda dengan format <strong class="text-white">USER</strong> diikuti nomor <strong class="text-white">1 sampai 200</strong> (Contoh: <code class="text-amber-300">USER12</code>)</p>
+            
+            <input type="text" id="username-input" placeholder="Cth: USER1" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-center text-white font-mono uppercase tracking-widest text-sm mb-2 focus:outline-none focus:border-amber-500">
+            <p id="login-error" class="text-red-500 text-xs mb-4 h-4"></p>
+            
+            <button id="login-btn" class="w-full bg-amber-700 hover:bg-amber-600 active:bg-amber-800 text-white font-bold py-2.5 rounded-lg text-sm transition-all shadow-lg cursor-pointer">
+                MASUK CHANNEL
+            </button>
+        </div>
+    </div>
+
+    <!-- KONTAINER UTAMA APLIKASI -->
+    <div id="app-container" class="hidden flex flex-col md:flex-row gap-6 items-center justify-center w-full max-w-2xl">
         
-        <!-- Merek -->
-        <div class="bg-amber-900 px-4 py-1 rounded-full text-xs font-bold tracking-widest text-amber-200 mb-4 shadow-inner">
-            CB-MULTI 2026
-        </div>
+        <!-- Walkie Talkie Box -->
+        <div class="bg-amber-700 border-4 border-amber-900 rounded-3xl p-6 shadow-2xl w-full max-w-xs flex flex-col items-center relative">
+            <div id="welcome-user" class="bg-amber-900 px-3 py-1 rounded-full text-[11px] font-bold tracking-wider text-amber-200 mb-4 shadow-inner"></div>
 
-        <!-- Pemilih Channel -->
-        <div class="w-full mb-4">
-            <label class="block text-[10px] uppercase font-mono text-amber-200 mb-1">Pilih Channel:</label>
-            <select id="channel-select" class="w-full bg-amber-950 border border-amber-900 text-white text-xs rounded-lg p-2 font-mono focus:outline-none">
-                <option value="channel-1">Channel 1 (Frekuensi 144.00 MHz)</option>
-                <option value="channel-2">Channel 2 (Frekuensi 146.50 MHz)</option>
-                <option value="channel-3">Channel 3 (Frekuensi 148.20 MHz)</option>
-            </select>
-        </div>
-
-        <!-- Speaker Grill -->
-        <div class="w-32 bg-amber-950 rounded-lg p-2 mb-6 flex flex-col gap-1.5 shadow-inner">
-            <div class="h-1 bg-amber-900 rounded"></div>
-            <div class="h-1 bg-amber-900 rounded"></div>
-            <div class="h-1 bg-amber-900 rounded"></div>
-            <div class="h-1 bg-amber-900 rounded"></div>
-        </div>
-
-        <!-- Panel Status -->
-        <div class="bg-slate-950 border-2 border-slate-800 rounded-xl p-4 w-full text-center mb-6 shadow-inner">
-            <div class="items-center justify-center gap-2 mb-2 flex">
-                <div id="led" class="w-4 h-4 rounded-full bg-red-600 shadow-[0_0_10px_red] transition-all"></div>
-                <span id="status-text" class="text-xs font-mono uppercase text-slate-400">Standby</span>
+            <div class="w-full mb-4">
+                <label class="block text-[10px] uppercase font-mono text-amber-200 mb-1">Pilih Channel:</label>
+                <select id="channel-select" class="w-full bg-amber-950 border border-amber-900 text-white text-xs rounded-lg p-2 font-mono focus:outline-none">
+                    <option value="channel-1">Channel 1 (144.00 MHz)</option>
+                    <option value="channel-2">Channel 2 (146.50 MHz)</option>
+                    <option value="channel-3">Channel 3 (148.20 MHz)</option>
+                </select>
             </div>
-            <p id="info-text" class="text-[11px] text-slate-500">Tahan PTT untuk bicara di channel aktif</p>
+
+            <div class="w-32 bg-amber-950 rounded-lg p-2 mb-6 flex flex-col gap-1.5 shadow-inner">
+                <div class="h-1 bg-amber-900 rounded"></div>
+                <div class="h-1 bg-amber-900 rounded"></div>
+                <div class="h-1 bg-amber-900 rounded"></div>
+                <div class="h-1 bg-amber-900 rounded"></div>
+            </div>
+
+            <div class="bg-slate-950 border-2 border-slate-800 rounded-xl p-4 w-full text-center mb-6 shadow-inner">
+                <div class="items-center justify-center gap-2 mb-2 flex">
+                    <div id="led" class="w-4 h-4 rounded-full bg-red-600 shadow-[0_0_10px_red] transition-all"></div>
+                    <span id="status-text" class="text-xs font-mono uppercase text-slate-400">Standby</span>
+                </div>
+                <p id="info-text" class="text-[11px] text-slate-500">Tahan PTT untuk bicara</p>
+            </div>
+
+            <button id="ptt-btn" class="w-28 h-28 bg-red-600 hover:bg-red-500 active:bg-red-700 border-4 border-red-800 rounded-full shadow-[0_8px_0_#7f1d1d] active:shadow-[0_2px_0_#7f1d1d] active:translate-y-2 transition-all flex items-center justify-center text-white font-black text-lg tracking-wider cursor-pointer select-none">
+                PTT
+            </button>
+
+            <div class="absolute -top-12 right-8 w-2 h-14 bg-slate-400 rounded-t-full border border-slate-500 -rotate-12"></div>
         </div>
 
-        <!-- Tombol PTT -->
-        <button id="ptt-btn" class="w-28 h-28 bg-red-600 hover:bg-red-500 active:bg-red-700 border-4 border-red-800 rounded-full shadow-[0_8px_0_#7f1d1d] active:shadow-[0_2px_0_#7f1d1d] active:translate-y-2 transition-all flex items-center justify-center text-white font-black text-lg tracking-wider cursor-pointer select-none">
-            PTT
-        </button>
+        <!-- Live Board Panel -->
+        <div class="bg-slate-950 border-2 border-slate-800 rounded-2xl p-4 w-full max-w-xs shadow-xl flex flex-col h-80">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-2 mb-3">
+                <h3 class="text-xs font-mono uppercase tracking-widest text-amber-500 font-bold">Live Board (Online)</h3>
+                <span class="w-2.5 h-2.5 rounded-full bg-green-500 animate-pulse"></span>
+            </div>
+            <ul id="live-board-list" class="flex flex-col gap-2 overflow-y-auto flex-1 pr-1">
+                <!-- Daftar user online akan muncul di sini secara otomatis -->
+            </ul>
+        </div>
 
-        <!-- Antena -->
-        <div class="absolute -top-12 right-8 w-2 h-14 bg-slate-400 rounded-t-full border border-slate-500 -rotate-12"></div>
     </div>
 
 </body>
